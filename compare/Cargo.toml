@@ -16,3 +16,11 @@ rustyass = { path = ".." }
 
 [build-dependencies]
 pkg-config = "0.3"
+
+[[bench]]
+name = "render"
+harness = false
+
+[[bench]]
+name = "memory"
+harness = false

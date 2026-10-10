@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use rustyass::Margins;
-use rustyass_compare::{Libass, Rusty, composite, diff, write_png};
+use rustyass_compare::{Libass, Rusty, composite, diff, scripts, write_png};
 
 const W: i32 = 640;
 const H: i32 = 360;
@@ -37,20 +37,24 @@ const BORDERED: &str = "40,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,1
 
 /// Renders both at `ms` and checks how far apart they are.
 fn check(name: &str, script: &str, ms: i64, max_over16: f32) {
+    check_at(name, script, ms, (W, H), max_over16);
+}
+
+fn check_at(name: &str, script: &str, ms: i64, (w, h): (i32, i32), max_over16: f32) {
     let fonts = [font()];
     let mut a = Libass::new(script.as_bytes(), &fonts, Some("Noto Sans")).unwrap();
     let mut b = Rusty::new(script.as_bytes(), &fonts, Some("Noto Sans")).unwrap();
-    a.set_frame((W, H), (W, H), Margins::default());
-    b.set_frame((W, H), (W, H), Margins::default());
+    a.set_frame((w, h), (w, h), Margins::default());
+    b.set_frame((w, h), (w, h), Margins::default());
 
     let (ia, _) = a.render(ms);
     let (ib, _) = b.render(ms);
-    let (ca, cb) = (composite(W, H, &ia), composite(W, H, &ib));
+    let (ca, cb) = (composite(w, h, &ia), composite(w, h, &ib));
     let d = diff(&ca, &cb);
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/rustyass-compare");
     std::fs::create_dir_all(&dir).unwrap();
-    write_png(&dir.join(format!("{name}.png")), W, H, &ca, &cb);
+    write_png(&dir.join(format!("{name}.png")), w, h, &ca, &cb);
     eprintln!("{name}: libass {} images, rustyass {}; {d:?}", ia.len(), ib.len());
 
     assert!(d.drawn > 0, "{name}: nothing drawn");
@@ -124,4 +128,11 @@ fn fade_and_move() {
 #[test]
 fn collisions() {
     check("collisions", &script(PLAIN, &["First", "Second", "Third"]), 1000, 0.05);
+}
+
+#[test]
+fn benchmark_scripts() {
+    check_at("bench-dialogue", &scripts::dialogue(10), 5200, (1920, 1080), 0.05);
+    check_at("bench-typesetting", &scripts::typesetting(10), 5600, (1920, 1080), 0.1);
+    check_at("bench-karaoke", &scripts::karaoke(10), 5300, (1920, 1080), 0.15);
 }

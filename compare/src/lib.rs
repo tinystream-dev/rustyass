@@ -11,6 +11,8 @@ use std::ptr;
 use libass_src as _;
 use rustyass::{Fonts, Margins, Renderer, Track};
 
+pub mod scripts;
+
 #[repr(C)]
 struct AssLibrary {
     _private: [u8; 0],
@@ -84,6 +86,7 @@ pub struct Libass {
     lib: *mut AssLibrary,
     renderer: *mut AssRenderer,
     track: *mut AssTrack,
+    frame: (i32, i32),
 }
 
 impl Libass {
@@ -117,11 +120,13 @@ impl Libass {
                 return None;
             }
 
-            Some(Libass { lib, renderer, track })
+            Some(Libass { lib, renderer, track, frame: (0, 0) })
         }
     }
 
     pub fn set_frame(&mut self, frame: (i32, i32), storage: (i32, i32), m: Margins) {
+        self.frame = frame;
+
         unsafe {
             ass_set_frame_size(self.renderer, frame.0, frame.1);
             ass_set_storage_size(self.renderer, storage.0, storage.1);
@@ -152,6 +157,27 @@ impl Libass {
         }
 
         (out, changed != 0)
+    }
+
+    /// Renders without copying the images out; how many there are.
+    pub fn draw(&mut self, ms: i64) -> usize {
+        let mut img = unsafe { ass_render_frame(self.renderer, self.track, ms, ptr::null_mut()) };
+        let mut n = 0;
+
+        while let Some(i) = unsafe { img.as_ref() } {
+            n += 1;
+            img = i.next;
+        }
+
+        n
+    }
+
+    /// Empties the glyph and bitmap caches, as changing the frame size does.
+    pub fn clear_caches(&mut self) {
+        unsafe {
+            ass_set_frame_size(self.renderer, self.frame.0 + 1, self.frame.1);
+            ass_set_frame_size(self.renderer, self.frame.0, self.frame.1);
+        }
     }
 }
 
@@ -218,6 +244,14 @@ impl Rusty {
             .collect();
 
         (images, r.changed)
+    }
+
+    pub fn draw(&mut self, ms: i64) -> usize {
+        self.renderer.render(&self.track, ms).images.len()
+    }
+
+    pub fn clear_caches(&mut self) {
+        self.renderer.clear_caches();
     }
 }
 
