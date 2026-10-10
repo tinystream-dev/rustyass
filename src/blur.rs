@@ -178,15 +178,27 @@ impl Image {
         (y >= 0 && (y as usize) < self.h).then(|| &self.data[y as usize * self.stride..][..self.stride])
     }
 
+    /// The image turned on its side, eight by eight pixels at a time.
     fn transpose(&self) -> Image {
         let mut t = Image::new(self.h, self.w);
 
-        for by in (0..self.h).step_by(16) {
-            for bx in (0..self.w).step_by(16) {
-                for y in by..(by + 16).min(self.h) {
-                    for x in bx..(bx + 16).min(self.w) {
-                        t.data[x * t.stride + y] = self.data[y * self.stride + x];
+        for by in (0..self.h).step_by(8) {
+            for bx in (0..self.w).step_by(8) {
+                let mut v: [Simd<i16, 8>; 8] = std::array::from_fn(|i| load::<8>(self.row((by + i) as isize), bx));
+
+                // Interleaving rows k and k + 4 three times over transposes the block.
+                for _ in 0..3 {
+                    let mut n = v;
+
+                    for k in 0..4 {
+                        (n[2 * k], n[2 * k + 1]) = v[k].interleave(v[k + 4]);
                     }
+
+                    v = n;
+                }
+
+                for (x, col) in (bx..self.w).zip(v) {
+                    col.copy_to_slice(&mut t.data[x * t.stride + by..][..8]);
                 }
             }
         }
@@ -255,24 +267,28 @@ fn expand_kernel<const N: usize>(src: &Image) -> Image {
 fn blur_kernel<const N: usize>(src: &Image, m: &Method) -> Image {
     let n = m.radius;
     let mut dst = Image::new(src.w, src.h + 2 * n);
+    let coeff = m.coeff.map(|c| Simd::<i32, N>::splat(c as i32));
+    let zero = vec![0i16; src.stride];
+    let row = |y: isize| src.row(y).unwrap_or(&zero).as_chunks::<N>().0;
 
     for (y, out) in dst.data.chunks_exact_mut(dst.stride).enumerate() {
-        let step = N;
-        let r = |k: isize| src.row(y as isize - n as isize + k);
-        let center = r(0);
+        let y = y as isize - n as isize;
+        let center = row(y);
+        let taps: [_; 8] = std::array::from_fn(|i| (row(y - 1 - i as isize), row(y + 1 + i as isize)));
+        let taps = &taps[..n];
+        let coeff = &coeff[..n];
 
-        for x in (0..src.stride).step_by(step) {
-            let c = load::<N>(center, x);
+        for (x, (c, out)) in center.iter().zip(out.as_chunks_mut::<N>().0).enumerate() {
+            let c = Simd::from_array(*c);
             let mut acc = Simd::<i32, N>::splat(0x8000);
 
-            for i in (1..=n).rev() {
-                let p = Simd::<i32, N>::splat(m.coeff[i - 1] as i32);
-                let a = (load::<N>(r(-(i as isize)), x) - c).cast::<i32>();
-                let b = (load::<N>(r(i as isize), x) - c).cast::<i32>();
+            for (p, (a, b)) in coeff.iter().zip(taps).rev() {
+                let a = (Simd::from_array(a[x]) - c).cast::<i32>();
+                let b = (Simd::from_array(b[x]) - c).cast::<i32>();
                 acc += a * p + b * p;
             }
 
-            (c + (acc >> 16).cast::<i16>()).copy_to_slice(&mut out[x..x + step]);
+            *out = (c + (acc >> 16).cast::<i16>()).to_array();
         }
     }
 
@@ -447,6 +463,29 @@ dispatch!(fn box_blur(data: &mut [u8], stride: usize, w: usize, h: usize) = box_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transposes() {
+        for (w, h) in [(1, 1), (7, 9), (8, 8), (33, 17), (70, 41)] {
+            let mut img = Image::new(w, h);
+
+            for y in 0..h {
+                for x in 0..w {
+                    img.data[y * img.stride + x] = (y * 1000 + x) as i16;
+                }
+            }
+
+            let t = img.transpose();
+            assert_eq!((t.w, t.h), (h, w));
+
+            for y in 0..w {
+                for x in 0..t.stride {
+                    let want = if x < h { (x * 1000 + y) as i16 } else { 0 };
+                    assert_eq!(t.data[y * t.stride + x], want, "{w}×{h} at {x}, {y}");
+                }
+            }
+        }
+    }
 
     fn dot() -> Bitmap {
         let mut b = Bitmap::new(0, 0, 9, 9);

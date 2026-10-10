@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 
 use crate::bitmap::{self, Bitmap};
 use crate::event::{Frame, Glyph, Resources};
-use crate::outline::{self, Path, Pt, Rect, pt};
+use crate::outline::{self, Path, Polys, Pt, Rect, pt};
 use crate::state::{ClipDrawing, State};
 use crate::{Image, ImageKind, blur, raster, stroke};
 
@@ -194,6 +194,8 @@ pub(crate) struct Caches {
     strokes: Cache<StrokeKey, Option<Arc<Stroked>>>,
     bitmaps: Cache<RasterKey, Option<Arc<Bitmap>>>,
     composites: Cache<CompositeKey, Arc<Composite>>,
+    /// Where masks' outlines are put on the screen.
+    scratch: [Polys; 2],
     next_id: u64,
     pub frame: u64,
 }
@@ -205,6 +207,7 @@ impl Caches {
             strokes: Cache::new(32 * MB),
             bitmaps: Cache::new(128 * MB),
             composites: Cache::new(64 * MB),
+            scratch: Default::default(),
             next_id: 1,
             frame: 0,
         }
@@ -234,6 +237,7 @@ impl Caches {
     pub fn clear(&mut self) {
         self.clear_bitmaps();
         self.outlines.clear();
+        self.scratch = Default::default();
     }
 
     fn outline(
@@ -319,21 +323,23 @@ impl Caches {
             return Some(Raster { bitmap: v, pos: q.pos, residual: q.residual });
         }
 
-        let map = |p: Pt| q.apply(p);
+        let [a, b] = &mut self.scratch;
+        a.clear();
+        b.clear();
 
         let bm = match shape {
             Shape::Path(o) => {
-                let mut lines = Vec::new();
-                o.path.map(map).flatten_d6(RASTERIZER_PRECISION, &mut lines);
-                raster::fill_groups(&[&lines], clip)
+                o.path.flatten_d6(|p| q.apply(p), RASTERIZER_PRECISION, a);
+                raster::fill_groups(&[a.lines()], clip)
             },
             Shape::Lines(s) => {
-                let sides: Vec<Vec<Vec<Pt>>> = s
-                    .sides
-                    .iter()
-                    .map(|side| side.iter().map(|l| l.iter().map(|&p| map(p)).collect()).collect())
-                    .collect();
-                raster::fill_groups(&[&sides[0], &sides[1]], clip)
+                for (side, out) in s.sides.iter().zip([&mut *a, &mut *b]) {
+                    for line in side {
+                        out.push().extend(line.iter().map(|&p| q.apply(p)));
+                    }
+                }
+
+                raster::fill_groups(&[a.lines(), b.lines()], clip)
             },
         };
 
@@ -759,10 +765,7 @@ pub(crate) fn bitmaps(
 
     let stroked = r.caches.stroke(key, || {
         let mut lines = Vec::new();
-        outline
-            .path
-            .map(|p| pt(p.x * scale.x + offset.x, p.y * scale.y + offset.y))
-            .flatten(tolerance / 4.0, &mut lines);
+        outline.path.flatten(|p| pt(p.x * scale.x + offset.x, p.y * scale.y + offset.y), tolerance / 4.0, &mut lines);
         stroke::stroke(&lines, bx, by, tolerance)
     });
 

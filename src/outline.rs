@@ -79,6 +79,37 @@ impl Seg {
     }
 }
 
+/// Closed polylines, their memory kept from one use to the next.
+#[derive(Default)]
+pub(crate) struct Polys {
+    lines: Vec<Vec<Pt>>,
+    len: usize,
+    /// Where [`Path::flatten_d6`] works.
+    d6: Vec<[i64; 2]>,
+}
+
+impl Polys {
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Starts a polyline.
+    pub fn push(&mut self) -> &mut Vec<Pt> {
+        if self.len == self.lines.len() {
+            self.lines.push(Vec::new());
+        }
+
+        self.len += 1;
+        let line = &mut self.lines[self.len - 1];
+        line.clear();
+        line
+    }
+
+    pub fn lines(&self) -> &[Vec<Pt>] {
+        &self.lines[..self.len]
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Path {
     pub points: Vec<Pt>,
@@ -138,8 +169,7 @@ impl Path {
 
         for contour in self.contours() {
             for seg in contour {
-                let pts = seg.points();
-                let (p0, p1) = (pts[0], pts[pts.len() - 1]);
+                let (p0, p1) = seg.ends();
                 a += p0.x * p1.y - p1.x * p0.y;
             }
         }
@@ -147,14 +177,18 @@ impl Path {
         a
     }
 
-    /// Lines approximating the outline to within `tolerance`, as closed polylines.
+    /// Lines approximating the outline, its points moved by `map`, as closed polylines.
     /// Flattens as libass's rasterizer does, on points in 64ths of a pixel: curves are halved
     /// until their control points are within `error` 64ths of the chord.
-    pub fn flatten_d6(&self, error: i64, out: &mut Vec<Vec<Pt>>) {
-        let d6 = |p: Pt| [(p.x * 64.0).round() as i64, (p.y * 64.0).round() as i64];
+    pub fn flatten_d6(&self, map: impl Fn(Pt) -> Pt, error: i64, out: &mut Polys) {
+        let d6 = |p: Pt| {
+            let p = map(p);
+            [(p.x * 64.0).round() as i64, (p.y * 64.0).round() as i64]
+        };
+        let mut poly = std::mem::take(&mut out.d6);
 
         for contour in self.contours() {
-            let mut poly: Vec<[i64; 2]> = Vec::new();
+            poly.clear();
 
             for seg in contour {
                 match seg {
@@ -167,19 +201,23 @@ impl Path {
             poly.dedup();
 
             if poly.len() >= 2 {
-                out.push(poly.into_iter().map(|[x, y]| pt(x as f64 / 64.0, y as f64 / 64.0)).collect());
+                out.push().extend(poly.iter().map(|&[x, y]| pt(x as f64 / 64.0, y as f64 / 64.0)));
             }
         }
+
+        out.d6 = poly;
     }
 
-    pub fn flatten(&self, tolerance: f64, out: &mut Vec<Vec<Pt>>) {
+    /// Lines approximating the outline, its points moved by `map`, to within `tolerance`, as
+    /// closed polylines.
+    pub fn flatten(&self, map: impl Fn(Pt) -> Pt, tolerance: f64, out: &mut Vec<Vec<Pt>>) {
         let tol2 = tolerance * tolerance;
 
         for contour in self.contours() {
             let mut poly = Vec::new();
 
             for seg in contour {
-                match seg {
+                match seg.map(&map) {
                     Segment::Line(a, _) => poly.push(a),
                     Segment::Quad(a, b, c) => {
                         poly.push(a);
@@ -229,11 +267,17 @@ pub(crate) enum Segment {
 }
 
 impl Segment {
-    pub fn points(&self) -> Vec<Pt> {
+    fn ends(&self) -> (Pt, Pt) {
         match *self {
-            Segment::Line(a, b) => vec![a, b],
-            Segment::Quad(a, b, c) => vec![a, b, c],
-            Segment::Cubic(a, b, c, d) => vec![a, b, c, d],
+            Segment::Line(a, b) | Segment::Quad(a, _, b) | Segment::Cubic(a, _, _, b) => (a, b),
+        }
+    }
+
+    fn map(self, f: impl Fn(Pt) -> Pt) -> Segment {
+        match self {
+            Segment::Line(a, b) => Segment::Line(f(a), f(b)),
+            Segment::Quad(a, b, c) => Segment::Quad(f(a), f(b), f(c)),
+            Segment::Cubic(a, b, c, d) => Segment::Cubic(f(a), f(b), f(c), f(d)),
         }
     }
 }
@@ -245,38 +289,64 @@ pub(crate) struct Contours<'a> {
 }
 
 impl<'a> Iterator for Contours<'a> {
-    type Item = std::vec::IntoIter<Segment>;
+    type Item = Contour<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let path = self.path;
+        let segments = &self.path.segments;
 
-        if self.segment >= path.segments.len() {
+        if self.segment >= segments.len() {
             return None;
         }
 
-        let first = self.point;
-        let mut segs = Vec::new();
+        let contour =
+            Contour { path: self.path, first: self.point, point: self.point, segment: self.segment, done: false };
 
-        while self.segment < path.segments.len() {
-            let (seg, end) = path.segments[self.segment];
-            let p = self.point;
+        while self.segment < segments.len() {
+            let (seg, end) = segments[self.segment];
             self.point += seg.order();
             self.segment += 1;
-            let next = if end || self.segment == path.segments.len() { first } else { self.point };
-            let at = |i: usize| path.points.get(i).copied().unwrap_or_default();
-
-            segs.push(match seg {
-                Seg::Line => Segment::Line(at(p), at(next)),
-                Seg::Quad => Segment::Quad(at(p), at(p + 1), at(next)),
-                Seg::Cubic => Segment::Cubic(at(p), at(p + 1), at(p + 2), at(next)),
-            });
 
             if end {
                 break;
             }
         }
 
-        Some(segs.into_iter())
+        Some(contour)
+    }
+}
+
+/// A contour's segments, as their start, control and end points.
+pub(crate) struct Contour<'a> {
+    path: &'a Path,
+    first: usize,
+    point: usize,
+    segment: usize,
+    done: bool,
+}
+
+impl Iterator for Contour<'_> {
+    type Item = Segment;
+
+    fn next(&mut self) -> Option<Segment> {
+        let path = self.path;
+
+        if self.done || self.segment >= path.segments.len() {
+            return None;
+        }
+
+        let (seg, end) = path.segments[self.segment];
+        let p = self.point;
+        self.point += seg.order();
+        self.segment += 1;
+        self.done = end;
+        let next = if end || self.segment == path.segments.len() { self.first } else { self.point };
+        let at = |i: usize| path.points.get(i).copied().unwrap_or_default();
+
+        Some(match seg {
+            Seg::Line => Segment::Line(at(p), at(next)),
+            Seg::Quad => Segment::Quad(at(p), at(p + 1), at(next)),
+            Seg::Cubic => Segment::Cubic(at(p), at(p + 1), at(p + 2), at(next)),
+        })
     }
 }
 
@@ -515,7 +585,7 @@ mod tests {
         let (path, _) = parse_drawing("m 0 0 b 10 0 10 10 0 10").unwrap();
         assert_eq!(path.segments, vec![(Seg::Cubic, false), (Seg::Line, true)]);
         let mut lines = Vec::new();
-        path.flatten(0.01, &mut lines);
+        path.flatten(|p| p, 0.01, &mut lines);
         assert!(lines[0].len() > 4);
     }
 
