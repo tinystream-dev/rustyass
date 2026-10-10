@@ -1405,8 +1405,10 @@ impl Layout<'_> {
                 let part = &mut g.parts[k];
                 part.pos = pt(device.x + part.pos.x * f.par, device.y + part.pos.y);
                 let first = cur.refs.is_empty();
+                let view = glyphs::view(f, &cur.filter);
 
-                if let Some(b) = glyphs::bitmaps(f, &self.s, r, g, k, flags, first, &mut residual, &mut cur.leftmost_x)
+                if let Some(b) =
+                    glyphs::bitmaps(f, &self.s, r, g, k, flags, first, &mut residual, &mut cur.leftmost_x, view)
                 {
                     cur.x = cur.x.min(b.pos.0);
                     cur.y = cur.y.min(b.pos.1);

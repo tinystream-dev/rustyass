@@ -283,6 +283,13 @@ dispatch!(fn shrink(src: &Image) -> Image = shrink_kernel::<16, 32>);
 dispatch!(fn expand(src: &Image) -> Image = expand_kernel::<16, 32>);
 dispatch!(fn blur(src: &Image, m: &Method) -> Image = blur_kernel::<16, 32>);
 
+/// How far apart, across and down, masks can start and still blur alike: the cascade's steps,
+/// and the dither's.
+pub(crate) fn grid(r2x: f64, r2y: f64) -> (i32, i32) {
+    let step = |r2: f64| if r2 > 0.001 { 1 << method(r2).level.max(1) } else { 2 };
+    (step(r2x), step(r2y))
+}
+
 /// Gaussian blur with variances `r2x` and `r2y`; the mask grows to hold it.
 pub(crate) fn gaussian(bm: &mut Bitmap, r2x: f64, r2y: f64) {
     if bm.is_empty() {

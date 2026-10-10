@@ -65,6 +65,8 @@ struct RasterKey {
     matrix: [i64; 4],
     persp: [i64; 2],
     frac: (u8, u8),
+    /// What of the mask was drawn, relative to its origin, when it isn't all of it.
+    clip: Option<[i32; 4]>,
 }
 
 struct Raster {
@@ -282,15 +284,35 @@ impl Caches {
     }
 
     /// The mask of `shape` under `m` (None when it draws nothing), where its origin goes, and
-    /// what rounding the position left over; None when the transform is unusable.
-    fn raster(&mut self, shape: &Shape, m: &[[f64; 3]; 3], delta: Option<Pt>) -> Option<Raster> {
+    /// what rounding the position left over; None when the transform is unusable. Only what's
+    /// within `view` on screen, if given, is drawn.
+    fn raster(
+        &mut self,
+        shape: &Shape,
+        m: &[[f64; 3]; 3],
+        delta: Option<Pt>,
+        view: Option<[i32; 4]>,
+    ) -> Option<Raster> {
         let (id, cbox) = match shape {
             Shape::Path(o) => (o.id, o.cbox),
             Shape::Lines(s) => (s.id, s.cbox),
         };
 
         let q = Quantized::new(m, &cbox, delta)?;
-        let key = RasterKey { source: id, matrix: q.matrix, persp: q.persp, frac: q.frac };
+        let clip = view.and_then(|[l, t, r, b]| {
+            let local = [l - q.pos.0, t - q.pos.1, r - q.pos.0, b - q.pos.1];
+            // Masks that the corners say fit aren't cut, so they're shared wherever they are.
+            let corners = [(cbox.x0, cbox.y0), (cbox.x1, cbox.y0), (cbox.x0, cbox.y1), (cbox.x1, cbox.y1)]
+                .map(|(x, y)| q.apply(pt(x, y)));
+            let fits = corners.iter().all(|p| {
+                p.x - 2.0 >= local[0] as f64
+                    && p.y - 2.0 >= local[1] as f64
+                    && p.x + 2.0 <= local[2] as f64
+                    && p.y + 2.0 <= local[3] as f64
+            });
+            (!fits).then_some(local)
+        });
+        let key = RasterKey { source: id, matrix: q.matrix, persp: q.persp, frac: q.frac, clip };
         let frame = self.frame;
 
         if let Some(v) = self.bitmaps.get(&key, frame) {
@@ -303,7 +325,7 @@ impl Caches {
             Shape::Path(o) => {
                 let mut lines = Vec::new();
                 o.path.map(map).flatten_d6(RASTERIZER_PRECISION, &mut lines);
-                raster::fill_groups(&[&lines])
+                raster::fill_groups(&[&lines], clip)
             },
             Shape::Lines(s) => {
                 let sides: Vec<Vec<Vec<Pt>>> = s
@@ -311,11 +333,12 @@ impl Caches {
                     .iter()
                     .map(|side| side.iter().map(|l| l.iter().map(|&p| map(p)).collect()).collect())
                     .collect();
-                raster::fill_groups(&[&sides[0], &sides[1]])
+                raster::fill_groups(&[&sides[0], &sides[1]], clip)
             },
         };
 
-        let bm = bm.filter(|b| !b.is_empty()).map(Arc::new);
+        // A mask cut to nothing is kept: it still counts as drawn.
+        let bm = bm.filter(|b| !b.is_empty() || b.cut.is_some()).map(Arc::new);
         let size = bm.as_ref().map(|b| b.bytes()).unwrap_or(0) + 64;
         self.bitmaps.insert(key, bm.clone(), size, frame);
         Some(Raster { bitmap: bm, pos: q.pos, residual: q.residual })
@@ -637,6 +660,7 @@ pub(crate) fn bitmaps(
     first: bool,
     residual: &mut Pt,
     leftmost_x: &mut f64,
+    view: [i32; 4],
 ) -> Option<BitmapRef> {
     let part = &g.parts[k];
     let outline = part.outline.clone()?;
@@ -659,7 +683,7 @@ pub(crate) fn bitmaps(
     }
 
     // The run's first glyph sets how the rest of it rounds.
-    let fill = r.caches.raster(&Shape::Path(outline.clone()), &m2, (!first).then_some(*residual))?;
+    let fill = r.caches.raster(&Shape::Path(outline.clone()), &m2, (!first).then_some(*residual), Some(view))?;
 
     if first {
         *residual = fill.residual;
@@ -694,7 +718,7 @@ pub(crate) fn bitmaps(
         let offset = pt(-bord.x, -bord.y - part.asc);
         let m = scaled(&m1, scale, offset);
 
-        out.set_border(r.caches.raster(&Shape::Path(unit), &m, delta));
+        out.set_border(r.caches.raster(&Shape::Path(unit), &m, delta, Some(view)));
         return out.has_any();
     }
 
@@ -743,7 +767,7 @@ pub(crate) fn bitmaps(
     });
 
     if let Some(st) = stroked {
-        out.set_border(r.caches.raster(&Shape::Lines(st), &m1, delta));
+        out.set_border(r.caches.raster(&Shape::Lines(st), &m1, delta, Some(view)));
     }
 
     out.has_any()
@@ -775,6 +799,18 @@ pub(crate) fn quantize_blur(radius: f64) -> (i32, i32) {
     (((radius).ln_1p() / BLUR_PRECISION).round() as i32, mask)
 }
 
+/// Where a run's masks can still show, as left, top, right and bottom on screen: the frame, as
+/// far around it as the run's blur, `\be` and shadow reach, and a frame's height more above and
+/// below, as overlapping events are moved up or down after they're drawn.
+pub(crate) fn view(f: &Frame, filter: &Filter) -> [i32; 4] {
+    // The blur cascade spreads a mask by less than 9 standard deviations.
+    let sigma = restore_blur(filter.blur_x.max(filter.blur_y)).sqrt();
+    let shadow = filter.shadow.0.abs().max(filter.shadow.1.abs()) >> 6;
+    let reach =
+        ((9.0 * sigma).ceil() as i64 + 16 + 2 * filter.be.max(0) as i64 + shadow as i64 + 1).min(1 << 24) as i32;
+    [-reach, -f.height - reach, f.width + reach, 2 * f.height + reach]
+}
+
 fn restore_blur(qblur: i32) -> f64 {
     let scale = 64.0 * BLUR_PRECISION / POSITION_PRECISION;
     let sigma = (BLUR_PRECISION * qblur as f64).exp_m1() / scale;
@@ -785,13 +821,17 @@ use crate::event::{
     FILTER_BORDER_STYLE_3, FILTER_FILL_IN_BORDER, FILTER_FILL_IN_SHADOW, FILTER_NONZERO_BORDER, FILTER_NONZERO_SHADOW,
 };
 
-/// Adds the glyphs' masks together, with room around them for `\be`.
-fn combine(parts: &[(&Arc<Bitmap>, (i32, i32))], pad: i32) -> Option<Bitmap> {
+/// Adds the glyphs' masks together, with room around them for `\be`. When some were cut, only
+/// what they drew is kept, its corner a multiple of `grid` from where the whole would start, so
+/// the blur's steps fall where they would have.
+fn combine(parts: &[(&Arc<Bitmap>, (i32, i32))], pad: i32, grid: (i32, i32)) -> Option<Bitmap> {
     if parts.is_empty() {
         return None;
     }
 
-    if pad == 0 && parts.len() == 1 {
+    let cut = parts.iter().any(|(b, _)| b.cut.is_some());
+
+    if pad == 0 && parts.len() == 1 && !cut {
         let (b, pos) = parts[0];
         let mut b = Bitmap::clone(b);
         b.left += pos.0;
@@ -799,16 +839,32 @@ fn combine(parts: &[(&Arc<Bitmap>, (i32, i32))], pad: i32) -> Option<Bitmap> {
         return Some(b);
     }
 
-    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    let union = |boxes: &mut dyn Iterator<Item = [i32; 4]>| {
+        boxes.fold([i32::MAX, i32::MAX, i32::MIN, i32::MIN], |u, b| {
+            [u[0].min(b[0]), u[1].min(b[1]), u[2].max(b[2]), u[3].max(b[3])]
+        })
+    };
 
-    for (b, pos) in parts {
-        x0 = x0.min(pos.0 + b.left);
-        y0 = y0.min(pos.1 + b.top);
-        x1 = x1.max(pos.0 + b.right());
-        y1 = y1.max(pos.1 + b.bottom());
+    let at = |b: [i32; 4], pos: (i32, i32)| [b[0] + pos.0, b[1] + pos.1, b[2] + pos.0, b[3] + pos.1];
+    let drawn = |b: &Bitmap| [b.left, b.top, b.right(), b.bottom()];
+    let whole = union(&mut parts.iter().map(|(b, pos)| at(b.cut.unwrap_or(drawn(b)), *pos)));
+    let [mut x0, mut y0, x1, y1] = [whole[0] - pad, whole[1] - pad, whole[2] + pad, whole[3] + pad];
+    let (mut x1, mut y1) = (x1, y1);
+
+    if cut {
+        let kept = union(&mut parts.iter().filter(|(b, _)| !b.is_empty()).map(|(b, pos)| at(drawn(b), *pos)));
+
+        if kept[0] > kept[2] {
+            return None;
+        }
+
+        x0 += (kept[0] - pad - x0).max(0) / grid.0 * grid.0;
+        y0 += (kept[1] - pad - y0).max(0) / grid.1 * grid.1;
+        x1 = x1.min(kept[2] + pad);
+        y1 = y1.min(kept[3] + pad);
     }
 
-    let mut dst = Bitmap::new(x0 - pad, y0 - pad, x1 - x0 + 2 * pad, y1 - y0 + 2 * pad);
+    let mut dst = Bitmap::new(x0, y0, x1 - x0, y1 - y0);
 
     for (b, pos) in parts {
         dst.add_at(b, *pos);
@@ -821,10 +877,11 @@ fn composite(filter: &Filter, refs: &[BitmapRef]) -> Composite {
     let pad = blur::be_padding(filter.be);
     let fills: Vec<_> = refs.iter().filter_map(|r| r.fill.as_ref().map(|b| (b, r.pos))).collect();
     let borders: Vec<_> = refs.iter().filter_map(|r| r.border.as_ref().map(|b| (b, r.pos_o))).collect();
-    let mut bm = combine(&fills, pad);
-    let mut bm_o = combine(&borders, pad);
     let flags = filter.flags;
     let (r2x, r2y) = (restore_blur(filter.blur_x), restore_blur(filter.blur_y));
+    let grid = blur::grid(r2x, r2y);
+    let mut bm = combine(&fills, pad, grid);
+    let mut bm_o = combine(&borders, pad, grid);
 
     let synth = |b: &mut Option<Bitmap>| {
         if let Some(b) = b {
@@ -902,7 +959,7 @@ pub(crate) fn vector_clip(f: &Frame, s: &State, r: &mut Resources, cd: &ClipDraw
         [0.0, 0.0, 1.0],
     ];
 
-    let Some(Raster { bitmap: Some(clip), pos, .. }) = r.caches.raster(&Shape::Path(entry), &m, None) else {
+    let Some(Raster { bitmap: Some(clip), pos, .. }) = r.caches.raster(&Shape::Path(entry), &m, None, None) else {
         if !cd.inverse {
             images.clear();
         }

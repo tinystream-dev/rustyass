@@ -17,6 +17,9 @@ pub(crate) struct Bitmap {
     pub h: i32,
     pub stride: usize,
     pub data: Vec<u8>,
+    /// When only part of the mask was drawn (what can't show being left out), the box, left,
+    /// top, right and bottom, all of it would have taken; it may then be empty.
+    pub cut: Option<[i32; 4]>,
 }
 
 pub(crate) fn stride_for(w: i32) -> usize {
@@ -26,7 +29,7 @@ pub(crate) fn stride_for(w: i32) -> usize {
 impl Bitmap {
     pub fn new(left: i32, top: i32, w: i32, h: i32) -> Bitmap {
         let stride = stride_for(w);
-        Bitmap { left, top, w, h, stride, data: vec![0; stride * h.max(0) as usize] }
+        Bitmap { left, top, w, h, stride, data: vec![0; stride * h.max(0) as usize], cut: None }
     }
 
     pub fn is_empty(&self) -> bool {

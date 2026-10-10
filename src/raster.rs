@@ -281,10 +281,28 @@ pub(crate) fn bounds(polys: &[Vec<Pt>]) -> Option<(i32, i32, i32, i32)> {
 }
 
 /// Coverage of each group, merged by taking the larger: a border's two offset outlines are
-/// filled apart, as each is meant on its own.
-pub(crate) fn fill_groups(groups: &[&[Vec<Pt>]]) -> Option<Bitmap> {
+/// filled apart, as each is meant on its own. Only what's within `clip` (left, top, right and
+/// bottom), if given, is drawn.
+pub(crate) fn fill_groups(groups: &[&[Vec<Pt>]], clip: Option<[i32; 4]>) -> Option<Bitmap> {
     let all: Vec<Vec<Pt>> = groups.iter().flat_map(|g| g.iter().cloned()).collect();
-    let (l, t, w, h) = bounds(&all)?;
+    let (mut l, mut t, mut w, mut h) = bounds(&all)?;
+    let full = [l, t, l + w, t + h];
+    let mut cut = None;
+
+    // Columns are summed from the top and edges above the mask count along its top, so a cut
+    // box covers the same as the whole one does.
+    if let Some([cl, ct, cr, cb]) = clip
+        && (l < cl || t < ct || l + w > cr || t + h > cb)
+    {
+        let (r, b) = ((l + w).min(cr), (t + h).min(cb));
+        (l, t) = (l.max(cl), t.max(ct));
+        (w, h) = ((r - l).max(0), (b - t).max(0));
+        cut = Some(full);
+
+        if w == 0 || h == 0 {
+            return Some(Bitmap { cut, ..Bitmap::new(l, t, 0, 0) });
+        }
+    }
     let mut out: Option<Bitmap> = None;
 
     for g in groups {
@@ -300,6 +318,7 @@ pub(crate) fn fill_groups(groups: &[&[Vec<Pt>]]) -> Option<Bitmap> {
 
     out.map(|mut b| {
         b.stride = stride_for(b.w);
+        b.cut = cut;
         b
     })
 }

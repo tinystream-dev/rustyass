@@ -136,3 +136,19 @@ fn benchmark_scripts() {
     check_at("bench-typesetting", &scripts::typesetting(10), 5600, (1920, 1080), 0.1);
     check_at("bench-karaoke", &scripts::karaoke(10), 5300, (1920, 1080), 0.15);
 }
+
+#[test]
+fn off_screen() {
+    let mut s = scripts::typesetting(0);
+
+    for e in [
+        "{\\pos(-150,540)\\blur40\\fs120}Blurred far left",
+        "{\\pos(960,-90)\\be40\\bord6\\fs100}Edges above",
+        "{\\pos(-300,200)\\shad200\\fs150}Shadow from the left",
+        "{\\pos(447,298)\\org(960,540)\\frx-9\\fry29\\blur0.8\\be1}Coming at you",
+    ] {
+        s += &format!("Dialogue: 0,0:00:00.00,0:00:10.00,Sign,,0,0,0,,{e}\n");
+    }
+
+    check_at("off-screen", &s, 1000, (1920, 1080), 0.05);
+}

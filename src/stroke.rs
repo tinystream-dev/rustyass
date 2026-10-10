@@ -112,7 +112,7 @@ mod tests {
 
     fn coverage(polys: &[Vec<Pt>], bx: f64, by: f64) -> crate::bitmap::Bitmap {
         let sides = stroke(polys, bx, by, 0.05);
-        raster::fill_groups(&[&sides[0], &sides[1]]).unwrap()
+        raster::fill_groups(&[&sides[0], &sides[1]], None).unwrap()
     }
 
     #[test]
