@@ -10,9 +10,41 @@ use crate::bitmap::{Bitmap, stride_for};
 use crate::outline::Pt;
 use crate::simd::dispatch;
 
+/// Columns a bit of [`Cells::touched`] stands for.
+const BLOCK: usize = 32;
+/// Masks with this many pixels or more keep track of which blocks edges touched.
+const TRACKED: usize = 1 << 16;
+
+/// Where edges add their areas: a cell per pixel, and two rows more (edges below the mask land in
+/// the first).
+struct Cells {
+    acc: Vec<f32>,
+    stride: usize,
+    /// For large masks, a bit per row and [`BLOCK`] columns that edges touched; the rest of a row
+    /// comes out as the row above did, so it's neither read nor summed. Empty for small masks.
+    touched: Vec<u64>,
+    words: usize,
+}
+
+impl Cells {
+    #[inline(always)]
+    fn add(&mut self, row: usize, x: usize, v: f32) {
+        self.acc[row * self.stride + x] += v;
+
+        if !self.touched.is_empty() {
+            let b = x / BLOCK;
+            self.touched[row * self.words + b / 64] |= 1 << (b % 64);
+        }
+    }
+}
+
 /// Rasterizes the polylines, given relative to the mask's corner, into a `w`×`h` mask at
 /// `(left, top)`.
 pub(crate) fn fill(polys: &[Vec<Pt>], left: i32, top: i32, w: i32, h: i32) -> Bitmap {
+    fill_with(polys, left, top, w, h, stride_for(w) * h.max(0) as usize >= TRACKED)
+}
+
+fn fill_with(polys: &[Vec<Pt>], left: i32, top: i32, w: i32, h: i32, tracked: bool) -> Bitmap {
     let mut bm = Bitmap::new(left, top, w, h);
 
     if bm.is_empty() {
@@ -20,29 +52,45 @@ pub(crate) fn fill(polys: &[Vec<Pt>], left: i32, top: i32, w: i32, h: i32) -> Bi
     }
 
     let (w, h, stride) = (w as usize, h as usize, bm.stride);
-    // Two rows more: edges below the mask land in the first.
-    let mut acc = vec![0f32; stride * (h + 2)];
+    let words = (stride / BLOCK).div_ceil(64);
+    let mut cells = Cells {
+        acc: vec![0f32; stride * (h + 2)],
+        stride,
+        touched: if tracked { vec![0; words * (h + 2)] } else { Vec::new() },
+        words,
+    };
 
     for poly in polys {
         let n = poly.len();
 
         for i in 0..n {
-            line(&mut acc, stride, w, h, poly[i], poly[(i + 1) % n]);
+            line(&mut cells, w, h, poly[i], poly[(i + 1) % n]);
         }
     }
 
-    integrate(&acc, &mut bm.data, stride, h);
+    if tracked {
+        integrate_touched(&cells.acc, &mut bm.data, stride, h, &cells.touched, words);
+    } else {
+        integrate(&cells.acc, &mut bm.data, stride, h);
+    }
+
     bm
 }
 
 /// Adds an edge's area into the cells of the columns it crosses; parts above or below the mask
 /// count as running along its top or bottom.
-fn line(acc: &mut [f32], stride: usize, w: usize, h: usize, p0: Pt, p1: Pt) {
+fn line(cells: &mut Cells, w: usize, h: usize, p0: Pt, p1: Pt) {
     if p0.x == p1.x || !(p0.x.is_finite() && p1.x.is_finite() && p0.y.is_finite() && p1.y.is_finite()) {
         return;
     }
 
     let hf = h as f64;
+
+    if (0.0..=hf).contains(&p0.y) && (0.0..=hf).contains(&p1.y) {
+        span(cells, w, h, p0, p1);
+        return;
+    }
+
     let mut cuts = [0.0, 1.0, 1.0, 1.0];
     let mut n = 1;
 
@@ -64,14 +112,14 @@ fn line(acc: &mut [f32], stride: usize, w: usize, h: usize, p0: Pt, p1: Pt) {
 
         if mid <= 0.0 || mid >= hf {
             let y = if mid <= 0.0 { 0.0 } else { hf };
-            span(acc, stride, w, h, crate::outline::pt(a.x, y), crate::outline::pt(b.x, y));
+            span(cells, w, h, crate::outline::pt(a.x, y), crate::outline::pt(b.x, y));
         } else {
-            span(acc, stride, w, h, a, b);
+            span(cells, w, h, a, b);
         }
     }
 }
 
-fn span(acc: &mut [f32], stride: usize, w: usize, h: usize, p0: Pt, p1: Pt) {
+fn span(cells: &mut Cells, w: usize, h: usize, p0: Pt, p1: Pt) {
     if p0.x == p1.x {
         return;
     }
@@ -98,7 +146,7 @@ fn span(acc: &mut [f32], stride: usize, w: usize, h: usize, p0: Pt, p1: Pt) {
 
         let (ya, yb) = if y < ynext { (y, ynext) } else { (ynext, y) };
         let (ya, yb) = (ya.clamp(0.0, hf), yb.clamp(0.0, hf));
-        let cell = |acc: &mut [f32], row: usize, v: f32| acc[row * stride + cx] += v;
+        let mut cell = |row: usize, v: f32| cells.add(row, cx, v);
         let y0f = ya.floor();
         let y0i = y0f as usize;
         let y1c = yb.ceil();
@@ -106,31 +154,31 @@ fn span(acc: &mut [f32], stride: usize, w: usize, h: usize, p0: Pt, p1: Pt) {
 
         if y1i <= y0i + 1 {
             let ymf = (0.5 * (ya + yb) - y0f) as f32;
-            cell(acc, y0i, d - d * ymf);
-            cell(acc, y0i + 1, d * ymf);
+            cell(y0i, d - d * ymf);
+            cell(y0i + 1, d * ymf);
         } else {
             let s = (1.0 / (yb - ya)) as f32;
             let yf0 = (ya - y0f) as f32;
             let a0 = 0.5 * s * (1.0 - yf0) * (1.0 - yf0);
             let yf1 = (yb - y1c + 1.0) as f32;
             let am = 0.5 * s * yf1 * yf1;
-            cell(acc, y0i, d * a0);
+            cell(y0i, d * a0);
 
             if y1i == y0i + 2 {
-                cell(acc, y0i + 1, d * (1.0 - a0 - am));
+                cell(y0i + 1, d * (1.0 - a0 - am));
             } else {
                 let a1 = s * (1.5 - yf0);
-                cell(acc, y0i + 1, d * (a1 - a0));
+                cell(y0i + 1, d * (a1 - a0));
 
                 for row in y0i + 2..y1i - 1 {
-                    cell(acc, row, d * s);
+                    cell(row, d * s);
                 }
 
                 let a2 = a1 + (y1i - y0i - 3) as f32 * s;
-                cell(acc, y1i - 1, d * (1.0 - a2 - am));
+                cell(y1i - 1, d * (1.0 - a2 - am));
             }
 
-            cell(acc, y1i, d * am);
+            cell(y1i, d * am);
         }
 
         y = ynext;
@@ -138,25 +186,73 @@ fn span(acc: &mut [f32], stride: usize, w: usize, h: usize, p0: Pt, p1: Pt) {
     }
 }
 
+/// Adds `N` cells from `x` on to the windings so far, and writes their coverage.
+#[inline(always)]
+fn sum<const N: usize>(run: &mut [f32], src: &[f32], dst: &mut [u8], x: usize) {
+    let r = Simd::<f32, N>::from_slice(&run[x..]) + Simd::from_slice(&src[x..]);
+    r.copy_to_slice(&mut run[x..x + N]);
+    // Clamped with a select, as a float min's NaN rules and saturating casts aren't single
+    // instructions on wasm and x86_64.
+    let a = r.abs();
+    let v = a.simd_lt(Simd::splat(1.0)).select(a * Simd::splat(256.0), Simd::splat(255.0));
+    // SAFETY: `v` is in 0..256.
+    unsafe { v.to_int_unchecked::<i32>() }.cast::<u8>().copy_to_slice(&mut dst[x..x + N]);
+}
+
 #[inline(always)]
 fn integrate_kernel<const N: usize>(acc: &[f32], out: &mut [u8], stride: usize, h: usize) {
     let mut run = vec![0f32; stride];
-    let (scale, max) = (Simd::<f32, N>::splat(256.0), Simd::<f32, N>::splat(255.0));
 
     for y in 0..h {
         let src = &acc[y * stride..][..stride];
         let dst = &mut out[y * stride..][..stride];
 
         for x in (0..stride).step_by(N) {
-            let r = Simd::<f32, N>::from_slice(&run[x..]) + Simd::from_slice(&src[x..]);
-            r.copy_to_slice(&mut run[x..x + N]);
-            let v = (r.abs() * scale).simd_min(max);
-            v.cast::<u8>().copy_to_slice(&mut dst[x..x + N]);
+            sum::<N>(&mut run, src, dst, x);
+        }
+    }
+}
+
+/// [`integrate_kernel`], summing only the blocks edges touched.
+#[inline(always)]
+fn integrate_touched_kernel<const N: usize>(
+    acc: &[f32],
+    out: &mut [u8],
+    stride: usize,
+    h: usize,
+    touched: &[u64],
+    words: usize,
+) {
+    let mut run = vec![0f32; stride];
+
+    for y in 0..h {
+        if y > 0 {
+            out.copy_within((y - 1) * stride..y * stride, y * stride);
+        }
+
+        let src = &acc[y * stride..][..stride];
+        let dst = &mut out[y * stride..][..stride];
+
+        for (i, &word) in touched[y * words..][..words].iter().enumerate() {
+            let mut bits = word;
+
+            while bits != 0 {
+                let block = (i * 64 + bits.trailing_zeros() as usize) * BLOCK;
+                bits &= bits - 1;
+
+                for x in (block..block + BLOCK).step_by(N) {
+                    sum::<N>(&mut run, src, dst, x);
+                }
+            }
         }
     }
 }
 
 dispatch!(fn integrate(acc: &[f32], out: &mut [u8], stride: usize, h: usize) = integrate_kernel::<16, 32>);
+dispatch!(
+    fn integrate_touched(acc: &[f32], out: &mut [u8], stride: usize, h: usize, touched: &[u64], words: usize)
+        = integrate_touched_kernel::<16, 32>
+);
 
 /// The mask's box: the polylines' bounds, a pixel more on each side.
 pub(crate) fn bounds(polys: &[Vec<Pt>]) -> Option<(i32, i32, i32, i32)> {
@@ -246,6 +342,21 @@ mod tests {
 
         let bm = fill(&[rect(0.0, 0.0, 4.0, 4.0), rect(1.0, 1.0, 3.0, 3.0)], 0, 0, 4, 4);
         assert_eq!(bm.data[bm.stride + 1], 255);
+    }
+
+    #[test]
+    fn tracking_blocks_changes_nothing() {
+        let star: Vec<Pt> = (0..14)
+            .map(|i| {
+                let (a, r) = (i as f64 * std::f64::consts::PI / 7.0, if i % 2 == 0 { 390.0 } else { 120.0 });
+                pt(400.5 + r * a.cos(), 300.25 + r * a.sin())
+            })
+            .collect();
+        let polys = [star, rect(10.3, 10.6, 700.2, 40.9), rect(-20.0, 500.5, 30.0, 700.0)];
+        let dense = fill_with(&polys, 0, 0, 800, 600, false);
+        let tracked = fill_with(&polys, 0, 0, 800, 600, true);
+        assert!(dense.data.contains(&255));
+        assert_eq!(dense.data, tracked.data);
     }
 
     #[test]

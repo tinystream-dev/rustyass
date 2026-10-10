@@ -177,6 +177,11 @@ impl Renderer {
         self.fit = (if cw * h >= ch * w { w } else { cw * h / ch }, if cw * h <= ch * w { h } else { ch * w / cw });
     }
 
+    /// Drops every cached outline and mask, to free memory; they're made again as they're needed.
+    pub fn clear_caches(&mut self) {
+        self.res.caches.clear();
+    }
+
     fn layout_res(&self, track: &Track) -> (i32, i32) {
         if track.layout_res.0 > 0 && track.layout_res.1 > 0 {
             track.layout_res

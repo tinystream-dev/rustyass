@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Shaping with HarfRust, and the bidirectional algorithm's levels and reordering.
 
-use std::collections::HashMap;
 use std::ops::Range;
 
-use harfrust::{Buffer, Direction, Feature, FontFuncs, GlyphId, Language, Script, ShapeOptions, ShaperFont, Tag};
+use harfrust::{
+    Buffer, Direction, Feature, FontFuncs, GlyphId, Language, Script, ShapeOptions, ShapePlan, ShaperFont, Tag,
+};
+use rustc_hash::FxHashMap;
 use unicode_bidi::{BidiClass, BidiInfo, Level, bidi_class};
 
 use crate::font::Face;
@@ -22,8 +24,13 @@ pub(crate) struct Shaped {
 
 pub(crate) struct Shaper {
     buffer: Option<Buffer>,
-    scripts: HashMap<u32, Option<Script>>,
+    scripts: FxHashMap<u32, Option<Script>>,
+    /// Making a plan each time was most of shaping.
+    plans: FxHashMap<PlanKey, ShapePlan>,
 }
+
+/// A face, direction, script, language and features (vertical, kerning, ligatures).
+type PlanKey = (u64, Direction, Option<Script>, Option<Language>, [bool; 3]);
 
 /// Metrics as libass hands them to HarfBuzz: advances rounded to whole pixels.
 struct Metrics<'a> {
@@ -59,7 +66,7 @@ pub(crate) struct Run<'a> {
 
 impl Shaper {
     pub fn new() -> Shaper {
-        Shaper { buffer: Some(Buffer::new()), scripts: HashMap::new() }
+        Shaper { buffer: Some(Buffer::new()), scripts: FxHashMap::default(), plans: FxHashMap::default() }
     }
 
     /// The character's script, None when it takes its neighbours' (common or inherited).
@@ -117,9 +124,20 @@ impl Shaper {
         let scale = (upem * face.scale() * 64.0).round() as i32;
         let metrics = Metrics { face, vertical: run.vertical };
         let font = ShaperFont::new(&face.shaping).with_scale(scale).with_font_funcs(Some(&metrics));
+        let key = (
+            face.uid,
+            buf.direction(),
+            buf.script(),
+            buf.language().cloned(),
+            [run.vertical, run.kerning, run.ligatures],
+        );
+        let plan = self
+            .plans
+            .entry(key)
+            .or_insert_with(|| ShapePlan::new(&face.shaping, buf.direction(), buf.script(), buf.language(), &features));
         let mut out = Vec::new();
 
-        if harfrust::shape(&font, &mut buf, ShapeOptions::new().features(&features)).is_ok() {
+        if harfrust::shape(&font, &mut buf, ShapeOptions::new().plan(Some(plan)).features(&features)).is_ok() {
             for (info, pos) in buf.glyph_infos().iter().zip(buf.glyph_positions()) {
                 out.push(Shaped {
                     cluster: info.cluster as usize,

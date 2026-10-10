@@ -2,9 +2,10 @@
 //! From outlines to masks: glyphs and drawings transformed, bordered and rasterized, then a
 //! run's masks added together, blurred and shadowed. Every step is cached.
 
-use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use crate::bitmap::{self, Bitmap};
 use crate::event::{Frame, Glyph, Resources};
@@ -93,7 +94,28 @@ pub(crate) struct Filter {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CompositeKey {
     filter: Filter,
-    refs: Vec<(usize, usize, (i32, i32), (i32, i32))>,
+    refs: Vec<(Held, Held, (i32, i32), (i32, i32))>,
+}
+
+/// A mask told apart by its address, which holding it keeps from going to another mask.
+#[derive(Clone)]
+struct Held(Option<Arc<Bitmap>>);
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Held) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        }
+    }
+}
+
+impl Eq for Held {}
+
+impl Hash for Held {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.as_ref().map_or(0, |b| Arc::as_ptr(b) as usize).hash(state);
+    }
 }
 
 /// A run's masks, positioned relative to the run.
@@ -112,14 +134,14 @@ struct Entry<V> {
 
 /// A cache trimmed back to its budget by dropping what was used longest ago.
 pub(crate) struct Cache<K, V> {
-    map: HashMap<K, Entry<V>>,
+    map: FxHashMap<K, Entry<V>>,
     size: usize,
     limit: usize,
 }
 
 impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
     fn new(limit: usize) -> Self {
-        Cache { map: HashMap::new(), size: 0, limit }
+        Cache { map: FxHashMap::default(), size: 0, limit }
     }
 
     fn get(&mut self, k: &K, frame: u64) -> Option<V> {
@@ -136,7 +158,9 @@ impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
         }
     }
 
-    fn trim(&mut self) {
+    /// Drops what was used longest ago, but nothing the last frame used: like libass, which keeps
+    /// what's on screen, so what's bigger than the budget isn't made again every frame.
+    fn trim(&mut self, frame: u64) {
         if self.size <= self.limit {
             return;
         }
@@ -144,8 +168,8 @@ impl<K: Hash + Eq + Clone, V: Clone> Cache<K, V> {
         let mut entries: Vec<(u64, K)> = self.map.iter().map(|(k, e)| (e.used, k.clone())).collect();
         entries.sort_by_key(|e| e.0);
 
-        for (_, k) in entries {
-            if self.size <= self.limit * 3 / 4 {
+        for (used, k) in entries {
+            if self.size <= self.limit * 3 / 4 || used + 1 >= frame {
                 break;
             }
 
@@ -192,10 +216,10 @@ impl Caches {
     /// Starts a frame, dropping what doesn't fit.
     pub fn start_frame(&mut self) {
         self.frame += 1;
-        self.composites.trim();
-        self.bitmaps.trim();
-        self.strokes.trim();
-        self.outlines.trim();
+        self.composites.trim(self.frame);
+        self.bitmaps.trim(self.frame);
+        self.strokes.trim(self.frame);
+        self.outlines.trim(self.frame);
     }
 
     /// Forgets everything drawn for the old frame size.
@@ -299,11 +323,9 @@ impl Caches {
 
     /// A run's masks combined, blurred and shadowed.
     pub fn composite(&mut self, filter: &Filter, refs: &[BitmapRef]) -> Arc<Composite> {
-        let id = |b: &Option<Arc<Bitmap>>| b.as_ref().map(|b| Arc::as_ptr(b) as usize).unwrap_or(0);
-
         let key = CompositeKey {
             filter: *filter,
-            refs: refs.iter().map(|r| (id(&r.fill), id(&r.border), r.pos, r.pos_o)).collect(),
+            refs: refs.iter().map(|r| (Held(r.fill.clone()), Held(r.border.clone()), r.pos, r.pos_o)).collect(),
         };
 
         let frame = self.frame;
