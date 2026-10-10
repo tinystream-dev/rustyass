@@ -1,0 +1,18 @@
+[package]
+name = "rustyass-compare"
+description = "rustyass against libass: fidelity tests and benchmarks, libass being the reference"
+version.workspace = true
+edition.workspace = true
+license = "LGPL-3.0-or-later"
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+libass-src = { path = "../../native/libass" }
+png = "0.18"
+rustyass = { path = ".." }
+
+[build-dependencies]
+pkg-config = "0.3"

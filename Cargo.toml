@@ -1,0 +1,17 @@
+[package]
+name = "rustyass"
+description = "An ASS/SSA subtitle renderer in pure Rust"
+version.workspace = true
+edition.workspace = true
+license = "LGPL-3.0-or-later"
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["ass", "ssa", "subtitles", "libass"]
+categories = ["multimedia::video", "rendering"]
+publish = false
+
+[dependencies]
+harfrust = "0.14"
+skrifa = "0.48"
+unicode-bidi = "0.3"
