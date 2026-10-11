@@ -192,6 +192,11 @@ impl Renderer {
         }
     }
 
+    /// What the last render drew.
+    pub fn images(&self) -> &[Image] {
+        &self.images
+    }
+
     /// The images showing at `ms`.
     pub fn render(&mut self, track: &Track, ms: i64) -> Rendered<'_> {
         if self.fonts.generation != self.generation {
