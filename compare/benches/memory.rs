@@ -26,7 +26,7 @@ fn main() {
 
     let font = std::env::var_os("RUSTYASS_FONT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts/NotoSans-Regular.ttf"));
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts/NotoSans-Regular.ttf"));
     let fonts = [std::fs::read(&font).unwrap_or_else(|e| panic!("{}: {e}", font.display()))];
     let text = match script {
         "dialogue" => scripts::dialogue(minutes * 60),

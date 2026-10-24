@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+    branches: [main]
+  pull_request:
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  test:
+    name: Format and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read rust-toolchain.toml
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt
+      # What compare/ builds libass and its dependencies with.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config meson ninja-build
+      - uses: actions/cache@v4
+        with:
+          path: .native
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('compare/libass/**') }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --check
+      - run: cargo test --workspace --locked
+      - run: cargo build -p rustyass --locked --target wasm32-unknown-unknown
+        env:
+          RUSTFLAGS: -C target-feature=+simd128
+      - run: cargo publish -p rustyass --dry-run --locked

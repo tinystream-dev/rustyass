@@ -6,12 +6,28 @@ edition.workspace = true
 license = "LGPL-3.0-or-later"
 authors.workspace = true
 repository.workspace = true
+readme = "README.md"
 keywords = ["ass", "ssa", "subtitles", "libass"]
 categories = ["multimedia::video", "rendering"]
-publish = false
+include = ["/src", "/COPYING", "/COPYING.LESSER", "/README.md"]
+
+[workspace]
+members = ["compare", "compare/libass"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+authors = ["Phrolova <me@phrolova.moe>"]
+repository = "https://github.com/tinystream-dev/rustyass"
 
 [dependencies]
 harfrust = "0.14"
 rustc-hash = "2"
 skrifa = "0.48"
 unicode-bidi = "0.3"
+
+# What the benchmarks build with: tinystream's release profile.
+[profile.release]
+lto = "thin"
+codegen-units = 1

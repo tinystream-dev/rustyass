@@ -11,7 +11,7 @@ const W: i32 = 640;
 const H: i32 = 360;
 
 fn font() -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts/NotoSans-Regular.ttf");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fonts/NotoSans-Regular.ttf");
     std::fs::read(path).unwrap()
 }
 
@@ -52,7 +52,7 @@ fn check_at(name: &str, script: &str, ms: i64, (w, h): (i32, i32), max_over16: f
     let (ca, cb) = (composite(w, h, &ia), composite(w, h, &ib));
     let d = diff(&ca, &cb);
 
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/rustyass-compare");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/rustyass-compare");
     std::fs::create_dir_all(&dir).unwrap();
     write_png(&dir.join(format!("{name}.png")), w, h, &ca, &cb);
     eprintln!("{name}: libass {} images, rustyass {}; {d:?}", ia.len(), ib.len());
